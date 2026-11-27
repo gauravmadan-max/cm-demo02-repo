@@ -61,6 +61,12 @@ def test_diagnostics_host_lookup(client):
     assert "localhost" in payload["result"] or "127.0.0.1" in payload["result"]
 
 
+def test_diagnostics_host_lookup_invalid_host(client):
+    resp = client.get("/api/diagnostics/host?host=localhost;id")
+    assert resp.status_code == 400
+    assert "invalid host" in resp.get_json()["error"]
+
+
 def test_greeting_banner(client):
     resp = client.get("/api/greeting?name=Alice")
     assert resp.status_code == 200

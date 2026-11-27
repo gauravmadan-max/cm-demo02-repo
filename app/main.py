@@ -71,6 +71,8 @@ def create_app(
             return jsonify({"error": "host query parameter is required"}), 400
         try:
             result = resolve_host(host)
+        except ValueError as exc:
+            return jsonify({"error": f"invalid host: {exc}"}), 400
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             return jsonify({"error": f"lookup failed: {exc}"}), 500
         return jsonify({"host": host, "result": result}), 200
