@@ -1,0 +1,252 @@
+name: CodeMender Auto-Verify and Fix PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_path:
+        description: "Directory or file to scan and remediate (e.g., app/ or app/auth.py)"
+        type: string
+        default: "app/"
+      max_fixes:
+        description: "Maximum number of CRITICAL/HIGH findings to patch in this run"
+        type: string
+        default: "2"
+      run_verify:
+        description: "Run exploit verification (cm verify) before patching"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+env:
+  GOOGLE_CLOUD_PROJECT: ${{ secrets.GCP_PROJECT_ID }}
+  CM_PLAIN: "true"
+
+jobs:
+  codemender-remediate:
+    name: Verify, Patch, Test, and Open Fix PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python and install app dependencies
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies and verify baseline unit tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pytest -v
+
+      - name: Authenticate to Google Cloud via WIF (Keyless OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+          create_credentials_file: true
+
+      - name: Restore cached CodeMender CLI
+        id: cache-cm
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/cm
+          key: cm-cli-linux-amd64-stable
+
+      - name: Install CodeMender CLI
+        if: steps.cache-cm.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o "${RUNNER_TEMP}/cm-linux-amd64.zip" \
+            "https://artifactregistry.googleapis.com/download/v1/projects/cmoc-prod/locations/us/repositories/codemender-cli-production/files/cm%3Astable%3Acm-linux-amd64.zip:download?alt=media"
+          unzip -o "${RUNNER_TEMP}/cm-linux-amd64.zip" -d "${RUNNER_TEMP}/cm-extract"
+          chmod +x "${RUNNER_TEMP}/cm-extract/cm"
+          mv "${RUNNER_TEMP}/cm-extract/cm" "$HOME/.local/bin/cm"
+
+      - name: Add CodeMender CLI to PATH and verify version
+        run: |
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/cm" --version
+
+      - name: Initialize CodeMender for headless remediation with pytest validation
+        run: |
+          cm init
+          cat << 'EOF' > "$HOME/.codemender/config.yaml"
+          output:
+            plain: true
+          tools:
+            confirm_commands: false
+            confirm_writes: false
+          execution:
+            interactive_mode: false
+          build:
+            command: "pytest -v"
+          EOF
+
+      - name: Run unbilled CodeMender health check
+        run: |
+          cm health
+
+      - name: Discover vulnerabilities on target path
+        env:
+          TARGET_PATH: ${{ inputs.target_path }}
+        run: |
+          set +e
+          cm find "${TARGET_PATH}" \
+            --deep \
+            --sandbox=false \
+            --bypass-warning \
+            -y
+          CM_EXIT=$?
+          set -e
+          if [ "${CM_EXIT}" -gt 1 ]; then
+            echo "::error::CodeMender find failed with exit code ${CM_EXIT}"
+            exit "${CM_EXIT}"
+          fi
+          cm report --format json > "${RUNNER_TEMP}/findings.json"
+          cm report
+
+      - name: Verify and remediate top CRITICAL/HIGH findings
+        id: remediate
+        env:
+          RUN_ID: ${{ github.run_id }}
+          MAX_FIXES: ${{ inputs.max_fixes }}
+          RUN_VERIFY: ${{ inputs.run_verify }}
+        run: |
+          BRANCH="codemender/fix-${RUN_ID}"
+          git config user.name "CodeMender Bot"
+          git config user.email "codemender-bot@users.noreply.github.com"
+          git checkout -b "${BRANCH}"
+
+          mapfile -t FINDING_IDS < <(
+            jq -r --argjson max "${MAX_FIXES}" '
+              [.[] | select(
+                (.severity == "CRITICAL" or .severity == "HIGH")
+                and ((.status // "OPEN") != "FIXED")
+                and ((.status // "OPEN") != "DISMISSED")
+              )] | .[:$max] | .[].finding_id
+            ' "${RUNNER_TEMP}/findings.json"
+          )
+
+          echo "Selected ${#FINDING_IDS[@]} finding(s) for remediation."
+          FIXED_LOG="${RUNNER_TEMP}/fixed-list.md"
+          : > "${FIXED_LOG}"
+          COMMITS=0
+
+          for FID in "${FINDING_IDS[@]}"; do
+            [ -z "${FID}" ] && continue
+            SHORT_ID="${FID:0:8}"
+            TITLE=$(jq -r --arg id "${FID}" '.[] | select(.finding_id == $id) | .title // "Security vulnerability"' "${RUNNER_TEMP}/findings.json" | head -n1)
+            SEV=$(jq -r --arg id "${FID}" '.[] | select(.finding_id == $id) | .severity // "HIGH"' "${RUNNER_TEMP}/findings.json" | head -n1)
+            FILE_PATH=$(jq -r --arg id "${FID}" '.[] | select(.finding_id == $id) | .file_path // ""' "${RUNNER_TEMP}/findings.json" | head -n1)
+
+            echo "============================================================"
+            echo "Processing finding ${SHORT_ID} [${SEV}]: ${TITLE} (${FILE_PATH})"
+            echo "============================================================"
+
+            VERIFY_NOTE="skipped"
+            if [ "${RUN_VERIFY}" = "true" ]; then
+              echo "Running cm verify ${FID}..."
+              cm verify "${FID}" --sandbox=false --bypass-warning --no-reset -y || true
+              UPDATED_STATUS=$(cm report "${FID}" --format json | jq -r '.[0].status // "OPEN"')
+              VERIFY_NOTE="${UPDATED_STATUS}"
+              if [ "${UPDATED_STATUS}" = "DISMISSED" ]; then
+                echo "Finding ${SHORT_ID} was DISMISSED during verification; skipping fix."
+                echo "- Skipped \`${SHORT_ID}\` (${SEV}) — **${TITLE}** (dismissed during verification)" >> "${FIXED_LOG}"
+                continue
+              fi
+            fi
+
+            echo "Running cm fix ${FID}..."
+            cm fix "${FID}" --sandbox=false --bypass-warning --no-reset -y || true
+
+            if ! git diff --quiet; then
+              echo "Validating patch with pytest -v..."
+              if pytest -v; then
+                git add app/ tests/
+                git commit -m "fix(security): ${TITLE} (${SHORT_ID})"
+                COMMITS=$((COMMITS + 1))
+                echo "- Fixed \`${SHORT_ID}\` (**${SEV}**, verify: \`${VERIFY_NOTE}\`) — ${TITLE}" >> "${FIXED_LOG}"
+              else
+                echo "::warning::Patch for ${SHORT_ID} failed pytest; reverting this attempt."
+                git checkout -- .
+                echo "- Reverted \`${SHORT_ID}\` (${SEV}) — ${TITLE} (failed regression tests)" >> "${FIXED_LOG}"
+              fi
+            else
+              echo "No code changes produced for ${SHORT_ID}."
+              echo "- No patch applied for \`${SHORT_ID}\` (${SEV}) — ${TITLE}" >> "${FIXED_LOG}"
+            fi
+          done
+
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "commits=${COMMITS}" >> "$GITHUB_OUTPUT"
+
+      - name: Push fix branch and open Pull Request
+        id: open_pr
+        if: steps.remediate.outputs.commits != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.remediate.outputs.branch }}
+          COMMITS: ${{ steps.remediate.outputs.commits }}
+        run: |
+          git push -u origin "${BRANCH}"
+
+          {
+            echo "## Automated Security Remediation by CodeMender"
+            echo ""
+            echo "This pull request was generated autonomously by **Google Cloud CodeMender** running in GitHub Actions with keyless Workload Identity Federation (WIF)."
+            echo ""
+            echo "### Remediated Findings"
+            cat "${RUNNER_TEMP}/fixed-list.md"
+            echo ""
+            echo "### Verification"
+            echo "- Regression test suite (\`pytest -v\`) **passed** after each applied patch."
+            echo "- Human review and approval are required before merging."
+          } > "${RUNNER_TEMP}/pr-body.md"
+
+          PR_URL=$(gh pr create \
+            --base main \
+            --head "${BRANCH}" \
+            --title "fix(security): CodeMender automated remediation (${COMMITS} fix(es))" \
+            --body-file "${RUNNER_TEMP}/pr-body.md")
+
+          echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
+          echo "Opened Pull Request: ${PR_URL}"
+
+      - name: Write Job Summary
+        if: always()
+        env:
+          TARGET_PATH: ${{ inputs.target_path }}
+          RUN_VERIFY: ${{ inputs.run_verify }}
+          COMMITS: ${{ steps.remediate.outputs.commits || '0' }}
+          PR_URL: ${{ steps.open_pr.outputs.pr_url }}
+        run: |
+          {
+            echo "## CodeMender Autonomous Remediation Summary"
+            echo ""
+            echo "- **Target Path:** \`${TARGET_PATH}\`"
+            echo "- **Verify Enabled:** \`${RUN_VERIFY}\`"
+            echo "- **Commits Created:** \`${COMMITS}\`"
+            if [ -n "${PR_URL}" ]; then
+              echo "- **Pull Request:** ${PR_URL}"
+            fi
+            echo ""
+            if [ -s "${RUNNER_TEMP}/fixed-list.md" ]; then
+              echo "### Per-Finding Outcome"
+              cat "${RUNNER_TEMP}/fixed-list.md"
+              echo ""
+            fi
+            echo "### Token & Session Stats"
+            echo '```text'
+            cm stats || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

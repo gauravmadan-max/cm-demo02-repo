@@ -1,0 +1,20 @@
+# Project-scoped CodeMender configuration for cm-demo02-repo.
+# Headless CI settings (confirm_commands, confirm_writes, interactive_mode,
+# build.command) are written to ~/.codemender/config.yaml in the GitHub Actions
+# runner because repo-level config follows directional safety merge rules.
+
+team_id: "cm-demo02"
+
+scan:
+  extensions:
+    include:
+      - ".py"
+  exclude_dirs:
+    - ".venv"
+    - "venv"
+    - "__pycache__"
+    - ".pytest_cache"
+    - "tests"
+
+output:
+  plain: true

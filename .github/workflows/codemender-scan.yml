@@ -1,0 +1,196 @@
+name: CodeMender Security Scan
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      scan_mode:
+        description: "Scan mode for baseline run"
+        type: choice
+        default: deep
+        options:
+          - deep
+          - quick
+      fail_on_findings:
+        description: "Fail workflow if CRITICAL or HIGH findings are detected"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+
+env:
+  GOOGLE_CLOUD_PROJECT: ${{ secrets.GCP_PROJECT_ID }}
+  CM_PLAIN: "true"
+
+jobs:
+  codemender-scan:
+    name: CodeMender Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Authenticate to Google Cloud via WIF (Keyless OIDC)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+          create_credentials_file: true
+
+      - name: Restore cached CodeMender CLI
+        id: cache-cm
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/cm
+          key: cm-cli-linux-amd64-stable
+
+      - name: Install CodeMender CLI
+        if: steps.cache-cm.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o "${RUNNER_TEMP}/cm-linux-amd64.zip" \
+            "https://artifactregistry.googleapis.com/download/v1/projects/cmoc-prod/locations/us/repositories/codemender-cli-production/files/cm%3Astable%3Acm-linux-amd64.zip:download?alt=media"
+          unzip -o "${RUNNER_TEMP}/cm-linux-amd64.zip" -d "${RUNNER_TEMP}/cm-extract"
+          chmod +x "${RUNNER_TEMP}/cm-extract/cm"
+          mv "${RUNNER_TEMP}/cm-extract/cm" "$HOME/.local/bin/cm"
+
+      - name: Add CodeMender CLI to PATH and verify version
+        run: |
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/cm" --version
+
+      - name: Initialize CodeMender for headless CI
+        run: |
+          cm init
+          cat << 'EOF' > "$HOME/.codemender/config.yaml"
+          output:
+            plain: true
+          tools:
+            confirm_commands: false
+            confirm_writes: false
+          execution:
+            interactive_mode: false
+          EOF
+
+      - name: Run unbilled CodeMender health check (WIF + IAM verification)
+        run: |
+          cm health
+
+      - name: Run CodeMender vulnerability scan
+        id: cm_scan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          SCAN_MODE: ${{ inputs.scan_mode || 'deep' }}
+          FAIL_ON_FINDINGS: ${{ inputs.fail_on_findings }}
+        run: |
+          set +e
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
+            echo "Running PR impact-aware diff scan against origin/${BASE_REF}..."
+            cm find . \
+              --diff="origin/${BASE_REF}" \
+              --fail-on=CRITICAL,HIGH \
+              --sandbox=false \
+              --bypass-warning \
+              -y
+            CM_EXIT=$?
+          else
+            SCAN_FLAG="--${SCAN_MODE}"
+            FAIL_ARGS=()
+            if [ "${FAIL_ON_FINDINGS}" = "true" ]; then
+              FAIL_ARGS=(--fail-on=CRITICAL,HIGH)
+            fi
+            echo "Running baseline scan on app/ (${SCAN_FLAG})..."
+            cm find app/ \
+              "${SCAN_FLAG}" \
+              "${FAIL_ARGS[@]}" \
+              --sandbox=false \
+              --bypass-warning \
+              -y
+            CM_EXIT=$?
+          fi
+          set -e
+
+          echo "cm_exit_code=${CM_EXIT}" >> "$GITHUB_OUTPUT"
+          echo "CodeMender find exited with code: ${CM_EXIT}"
+
+          # Exit 0 = clean, Exit 1 = CI gate triggered (CRITICAL/HIGH found).
+          # Any other non-zero exit code indicates a real CLI/auth/runtime error.
+          if [ "${CM_EXIT}" -gt 1 ]; then
+            echo "::error::CodeMender scan failed with unexpected exit code ${CM_EXIT}"
+            exit "${CM_EXIT}"
+          fi
+
+      - name: Export SARIF and Markdown reports
+        id: export_reports
+        if: always() && (steps.cm_scan.outputs.cm_exit_code == '0' || steps.cm_scan.outputs.cm_exit_code == '1')
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          SCAN_MODE: ${{ inputs.scan_mode || 'deep' }}
+          CM_EXIT_CODE: ${{ steps.cm_scan.outputs.cm_exit_code }}
+        run: |
+          cm report --format sarif > "${RUNNER_TEMP}/codemender-results.sarif" || true
+          cm report --format md > "${RUNNER_TEMP}/codemender-summary.md" || true
+
+          if [ -s "${RUNNER_TEMP}/codemender-results.sarif" ]; then
+            echo "has_sarif=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_sarif=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          {
+            echo "## CodeMender Security Scan Summary"
+            echo ""
+            if [ "${EVENT_NAME}" = "pull_request" ]; then
+              echo "- **Mode:** Pull Request Diff Scan (\`--diff=origin/${BASE_REF}\`)"
+            else
+              echo "- **Mode:** Baseline Scan (\`--${SCAN_MODE}\` on \`app/\`)"
+            fi
+            echo "- **Authentication:** Keyless GCP Workload Identity Federation (WIF)"
+            echo "- **Scan Exit Code:** \`${CM_EXIT_CODE}\`"
+            echo ""
+            if [ -s "${RUNNER_TEMP}/codemender-summary.md" ]; then
+              cat "${RUNNER_TEMP}/codemender-summary.md"
+            else
+              echo "No findings reported."
+            fi
+            echo ""
+            echo "### Token & Session Stats"
+            echo '```text'
+            cm stats || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always() && steps.export_reports.outputs.has_sarif == 'true'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ runner.temp }}/codemender-results.sarif
+          category: codemender
+
+      - name: Upload scan report artifacts
+        if: always() && (steps.cm_scan.outputs.cm_exit_code == '0' || steps.cm_scan.outputs.cm_exit_code == '1')
+        uses: actions/upload-artifact@v4
+        with:
+          name: codemender-scan-reports
+          path: |
+            ${{ runner.temp }}/codemender-results.sarif
+            ${{ runner.temp }}/codemender-summary.md
+          if-no-files-found: ignore
+
+      - name: Enforce security gate
+        if: steps.cm_scan.outputs.cm_exit_code == '1'
+        run: |
+          echo "::error::CodeMender detected blocking CRITICAL or HIGH vulnerabilities."
+          exit 1
