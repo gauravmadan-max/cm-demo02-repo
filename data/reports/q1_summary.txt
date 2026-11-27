@@ -1,0 +1,4 @@
+OpsPortal Quarterly Summary - Q1
+Status: All core services operational.
+Incidents resolved: 14
+Uptime: 99.95%
